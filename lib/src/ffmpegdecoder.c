@@ -54,8 +54,24 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 		enum AVHWDeviceType type = av_hwdevice_find_type_by_name(hw_decoder_name);
 		if(type == AV_HWDEVICE_TYPE_NONE)
 		{
-			CHIAKI_LOGE(log, "Hardware decoder \"%s\" not found", hw_decoder_name);
-			goto error_codec_context;
+			// Not an hwaccel device type; try it as a full decoder name instead,
+			// e.g. h264_v4l2m2m / hevc_v4l2m2m on v4l2 stateful SoCs (qcom venus).
+			const AVCodec *named_codec = avcodec_find_decoder_by_name(hw_decoder_name);
+			if(!named_codec || named_codec->id != av_codec)
+			{
+				CHIAKI_LOGE(log, "Hardware decoder \"%s\" not found (neither hwaccel type nor %s decoder)",
+						hw_decoder_name, chiaki_codec_name(codec));
+				goto error_codec_context;
+			}
+			avcodec_free_context(&decoder->codec_context);
+			decoder->av_codec = named_codec;
+			decoder->codec_context = avcodec_alloc_context3(decoder->av_codec);
+			if(!decoder->codec_context)
+			{
+				CHIAKI_LOGE(log, "Failed to alloc codec context");
+				goto error_mutex;
+			}
+			goto open_codec;
 		}
 
 		for(int i = 0;; i++)
@@ -80,7 +96,15 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 		}
 		decoder->codec_context->hw_device_ctx = av_buffer_ref(decoder->hw_device_ctx);
 	}
+	else
+	{
+		// software decode: slice threading keeps latency low (cf. switch port)
+		decoder->codec_context->thread_type = FF_THREAD_SLICE;
+		decoder->codec_context->thread_count = 4;
+		decoder->codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	}
 
+open_codec:
 	if(avcodec_open2(decoder->codec_context, decoder->av_codec, NULL) < 0)
 	{
 		CHIAKI_LOGE(log, "Failed to open codec context");

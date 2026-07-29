@@ -19,7 +19,11 @@ struct chiaki_ffmpeg_decoder_t
 {
 	ChiakiLog *log;
 	ChiakiMutex mutex;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 0, 100)
+	const AVCodec *av_codec;
+#else
 	AVCodec *av_codec;
+#endif
 	AVCodecContext *codec_context;
 	enum AVPixelFormat hw_pix_fmt;
 	AVBufferRef *hw_device_ctx;
