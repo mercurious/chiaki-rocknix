@@ -853,6 +853,7 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	pad_open_first(&pad, log);
 
 	int exit_code = 0;
+	int in_use_retries = 0;
 	bool restart = true;
 	while(restart && !g_signal_quit)
 	{
@@ -864,6 +865,21 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 			exit_code = 1;
 			break;
 		}
+
+		// The console keeps the Remote Play slot busy for a few seconds after
+		// a disconnect (both toggle-reconnects and a previous hard-killed
+		// client hit this). Self-heal instead of surfacing 0x80108b10.
+		if(ending == PAD_ACTION_NONE
+			&& (ChiakiQuitReason)atomic_load(&ctx.quit_reason) == CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE
+			&& in_use_retries < 6 && !g_signal_quit)
+		{
+			in_use_retries++;
+			CHIAKI_LOGW(log, "Console still holds a previous session, retrying (%d/6) in 2.5s", in_use_retries);
+			usleep(2500 * 1000);
+			restart = true;
+			continue;
+		}
+		in_use_retries = 0;
 
 		switch(ending)
 		{
