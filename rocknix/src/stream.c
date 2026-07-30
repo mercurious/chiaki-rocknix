@@ -18,11 +18,23 @@
 #include <argp.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+// SIGINT/SIGTERM must end the session cleanly (chiaki_session_stop says
+// goodbye to the console) — a hard kill leaves the console thinking Remote
+// Play is still in use and the next connect fails with 0x80108b10.
+static volatile sig_atomic_t g_signal_quit = 0;
+
+static void signal_handler(int sig)
+{
+	(void)sig;
+	g_signal_quit = 1;
+}
 
 static char doc[] = "Stream from the registered console (pair with `chiaki regist` first).";
 
@@ -641,6 +653,11 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 		return 1;
 	}
 
+	struct sigaction sa = { 0 };
+	sa.sa_handler = signal_handler;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+
 	PadState pad = { 0 };
 	pad_open_first(&pad, log);
 
@@ -693,9 +710,14 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 			} while(SDL_PollEvent(&event));
 		}
 
+		if(g_signal_quit)
+		{
+			CHIAKI_LOGI(log, "Signal received, quitting cleanly");
+			running = false;
+		}
 		if(pad_read(&pad, &controller_state))
 		{
-			CHIAKI_LOGI(log, "Quit gesture (Guide held)");
+			CHIAKI_LOGI(log, "Quit gesture held");
 			running = false;
 		}
 		chiaki_session_set_controller_state(&ctx.session, &controller_state);
