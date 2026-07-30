@@ -148,7 +148,54 @@ typedef struct stream_ctx
 	atomic_bool session_quit;
 	atomic_bool frame_pending;
 	atomic_int quit_reason;
+	// PS5 haptics -> rumble (cf. chiaki-ng): the haptics sink cb accumulates
+	// per-frame strengths here; the main loop averages and drives the motor
+	double haptics_mult; // 0 = off
+	atomic_uint haptics_sum;
+	atomic_uint haptics_count;
+	atomic_bool haptics_seen;
 } StreamCtx;
+
+#define HAPTIC_RUMBLE_MIN_STRENGTH 100
+#define HAPTIC_RUMBLE_INTERVAL_MS 30
+
+// Haptics frames are raw PCM int16 stereo. Strength = mean(|amplitude|) * 2
+// per channel, gated, floored to 9 bits (weak motors ignore less), max of
+// both channels — the exact conversion chiaki-ng ships for non-DualSense pads.
+static void haptics_frame_cb(uint8_t *buf, size_t buf_size, void *user)
+{
+	StreamCtx *ctx = user;
+	if(buf_size == 0 || (buf_size % (2 * sizeof(int16_t))) != 0)
+		return;
+	if(!atomic_exchange(&ctx->haptics_seen, true))
+		CHIAKI_LOGI(ctx->log, "Haptics stream flowing from console");
+
+	uint32_t suml = 0, sumr = 0;
+	size_t buf_count = buf_size / (2 * sizeof(int16_t));
+	for(size_t i = 0; i < buf_count; i++)
+	{
+		int16_t al, ar;
+		memcpy(&al, buf + i * 4, sizeof(int16_t));
+		memcpy(&ar, buf + i * 4 + 2, sizeof(int16_t));
+		suml += (uint32_t)(al < 0 ? -(int32_t)al : al) * 2;
+		sumr += (uint32_t)(ar < 0 ? -(int32_t)ar : ar) * 2;
+	}
+	uint32_t left = suml / buf_count;
+	uint32_t right = sumr / buf_count;
+	left = left > HAPTIC_RUMBLE_MIN_STRENGTH ? left : 0;
+	right = right > HAPTIC_RUMBLE_MIN_STRENGTH ? right : 0;
+	if(left == 0 && right == 0)
+		return;
+	left = (uint32_t)(left * ctx->haptics_mult);
+	right = (uint32_t)(right * ctx->haptics_mult);
+	if(left > UINT16_MAX) left = UINT16_MAX;
+	if(right > UINT16_MAX) right = UINT16_MAX;
+	if(left > 0 && left < (1 << 9)) left = 1 << 9;
+	if(right > 0 && right < (1 << 9)) right = 1 << 9;
+	uint32_t strength = left > right ? left : right;
+	atomic_fetch_add(&ctx->haptics_sum, strength);
+	atomic_fetch_add(&ctx->haptics_count, 1);
+}
 
 static void frame_available_cb(ChiakiFfmpegDecoder *decoder, void *user)
 {
@@ -659,6 +706,8 @@ static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
 	connect_info.video_profile = profile;
 	connect_info.video_profile_auto_downgrade = true;
 	connect_info.enable_keyboard = false;
+	// a declared DualSense is what makes the PS5 send the haptics stream
+	connect_info.enable_dualsense = is_ps5 && ctx->haptics_mult > 0.0;
 	memcpy(connect_info.regist_key, cfg->rp_regist_key, sizeof(connect_info.regist_key));
 	memcpy(connect_info.morning, cfg->rp_key, sizeof(connect_info.morning));
 
@@ -675,6 +724,15 @@ static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
 	chiaki_opus_decoder_set_cb(&ctx->opus_decoder, audio_settings_cb, audio_frame_cb, ctx);
 	chiaki_opus_decoder_get_sink(&ctx->opus_decoder, &audio_sink);
 	chiaki_session_set_audio_sink(&ctx->session, &audio_sink);
+	if(connect_info.enable_dualsense)
+	{
+		ChiakiAudioSink haptics_sink = { 0 };
+		haptics_sink.frame_cb = haptics_frame_cb;
+		haptics_sink.user = ctx;
+		chiaki_session_set_haptics_sink(&ctx->session, &haptics_sink);
+		atomic_store(&ctx->haptics_sum, 0);
+		atomic_store(&ctx->haptics_count, 0);
+	}
 	chiaki_session_set_video_sample_cb(&ctx->session, chiaki_ffmpeg_decoder_video_sample_cb, &ctx->video_decoder);
 	chiaki_session_set_event_cb(&ctx->session, session_event_cb, ctx);
 
@@ -691,6 +749,9 @@ static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
 
 	ChiakiControllerState controller_state;
 	chiaki_controller_state_set_idle(&controller_state);
+
+	Uint32 last_haptics_ms = SDL_GetTicks();
+	bool haptics_on = false;
 
 	PadAction ending = PAD_ACTION_NONE;
 	bool running = true;
@@ -772,6 +833,21 @@ static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
 			running = false;
 		}
 		chiaki_session_set_controller_state(&ctx->session, &controller_state);
+
+		// haptics -> rumble: average what arrived in the last window, keep
+		// the motor updated, and always send the final 0 to stop it cleanly
+		Uint32 now_ms = SDL_GetTicks();
+		if(now_ms - last_haptics_ms >= HAPTIC_RUMBLE_INTERVAL_MS)
+		{
+			last_haptics_ms = now_ms;
+			unsigned int count = atomic_exchange(&ctx->haptics_count, 0);
+			unsigned int sum = atomic_exchange(&ctx->haptics_sum, 0);
+			uint32_t avg = count ? sum / count : 0;
+			uint16_t strength = avg > UINT16_MAX ? UINT16_MAX : (uint16_t)avg;
+			if(pad->controller && (strength > 0 || haptics_on))
+				SDL_GameControllerRumble(pad->controller, strength, strength, HAPTIC_RUMBLE_INTERVAL_MS * 2);
+			haptics_on = strength > 0;
+		}
 	}
 
 	CHIAKI_LOGI(log, "Shutting down session");
@@ -841,6 +917,17 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	atomic_init(&ctx.session_quit, false);
 	atomic_init(&ctx.frame_pending, false);
 	atomic_init(&ctx.quit_reason, (int)CHIAKI_QUIT_REASON_NONE);
+	atomic_init(&ctx.haptics_sum, 0);
+	atomic_init(&ctx.haptics_count, 0);
+	atomic_init(&ctx.haptics_seen, false);
+	if(!strcmp(cfg.haptics, "off"))
+		ctx.haptics_mult = 0.0;
+	else if(!strcmp(cfg.haptics, "weak"))
+		ctx.haptics_mult = 0.5;
+	else if(!strcmp(cfg.haptics, "strong"))
+		ctx.haptics_mult = 2.0;
+	else
+		ctx.haptics_mult = 1.0;
 
 	SDL_Window *window = SDL_CreateWindow("Chiaki",
 		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,

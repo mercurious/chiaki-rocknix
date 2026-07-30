@@ -43,6 +43,7 @@ typedef enum ctrl_message_type_t {
 	CTRL_MESSAGE_TYPE_KEYBOARD_TEXT_CHANGE_REQ = 0x23,
 	CTRL_MESSAGE_TYPE_KEYBOARD_TEXT_CHANGE_RES = 0x24,
 	CTRL_MESSAGE_TYPE_KEYBOARD_CLOSE_REQ = 0x25,
+	CTRL_MESSAGE_TYPE_ENABLE_DUALSENSE_FEATURES = 0x13,
 } CtrlMessageType;
 
 typedef enum ctrl_login_state_t {
@@ -488,6 +489,15 @@ static void ctrl_message_received(ChiakiCtrl *ctrl, uint16_t msg_type, uint8_t *
 
 static void ctrl_enable_optional_features(ChiakiCtrl *ctrl)
 {
+	if(ctrl->session->connect_info.enable_dualsense)
+	{
+		// unlock the DualSense feature set (haptics audio stream) — cf. chiaki-ng ctrl_enable_features
+		CHIAKI_LOGI(ctrl->session->log, "Enabling DualSense features");
+		const uint8_t enable[3] = { 0x00, 0x40, 0x00 };
+		ctrl_message_send(ctrl, CTRL_MESSAGE_TYPE_ENABLE_DUALSENSE_FEATURES, enable, 3);
+		const uint8_t connect[0x10] = { 0xa0, 0xab, 0x51, 0xbd, 0xd1, 0x7e, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00 };
+		ctrl_message_send(ctrl, 0x11, connect, 0x10);
+	}
 	if(!ctrl->session->connect_info.enable_keyboard)
 		return;
 	// TODO: Last byte of pre_enable request is random (?)

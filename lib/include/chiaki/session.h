@@ -78,6 +78,7 @@ typedef struct chiaki_connect_info_t
 	ChiakiConnectVideoProfile video_profile;
 	bool video_profile_auto_downgrade; // Downgrade video_profile if server does not seem to support it.
 	bool enable_keyboard;
+	bool enable_dualsense; // declare a DualSense to the console so it sends the haptics audio stream (PS5)
 } ChiakiConnectInfo;
 
 
@@ -170,6 +171,7 @@ typedef struct chiaki_session_t
 		ChiakiConnectVideoProfile video_profile;
 		bool video_profile_auto_downgrade;
 		bool enable_keyboard;
+		bool enable_dualsense;
 	} connect_info;
 
 	ChiakiTarget target;
@@ -191,6 +193,7 @@ typedef struct chiaki_session_t
 	ChiakiVideoSampleCallback video_sample_cb;
 	void *video_sample_cb_user;
 	ChiakiAudioSink audio_sink;
+	ChiakiAudioSink haptics_sink; // receives raw PCM haptics frames (see is_haptics in takion)
 
 	ChiakiThread session_thread;
 
@@ -241,6 +244,11 @@ static inline void chiaki_session_set_video_sample_cb(ChiakiSession *session, Ch
 /**
  * @param sink contents are copied
  */
+static inline void chiaki_session_set_haptics_sink(ChiakiSession *session, ChiakiAudioSink *sink)
+{
+	session->haptics_sink = *sink;
+}
+
 static inline void chiaki_session_set_audio_sink(ChiakiSession *session, ChiakiAudioSink *sink)
 {
 	session->audio_sink = *sink;

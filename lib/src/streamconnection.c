@@ -53,6 +53,7 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
 static void stream_connection_takion_data_expect_bang(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
 static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
 static ChiakiErrorCode stream_connection_send_streaminfo_ack(ChiakiStreamConnection *stream_connection);
+static ChiakiErrorCode stream_connection_send_controller_connection(ChiakiStreamConnection *stream_connection);
 static void stream_connection_takion_av(ChiakiStreamConnection *stream_connection, ChiakiTakionAVPacket *packet);
 static ChiakiErrorCode stream_connection_send_heartbeat(ChiakiStreamConnection *stream_connection);
 
@@ -161,6 +162,17 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 	if(!stream_connection->audio_receiver)
 	{
 		CHIAKI_LOGE(session->log, "StreamConnection failed to initialize Audio Receiver");
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	// separate receiver for haptics frames: they share the audio channel but
+	// have their own frame-index sequence (cf. chiaki-ng)
+	stream_connection->haptics_receiver = chiaki_audio_receiver_new(session, NULL);
+	if(!stream_connection->haptics_receiver)
+	{
+		CHIAKI_LOGE(session->log, "StreamConnection failed to initialize Haptics Receiver");
+		chiaki_audio_receiver_free(stream_connection->audio_receiver);
+		stream_connection->audio_receiver = NULL;
 		return CHIAKI_ERR_UNKNOWN;
 	}
 
@@ -324,6 +336,8 @@ err_video_receiver:
 err_audio_receiver:
 	chiaki_audio_receiver_free(stream_connection->audio_receiver);
 	stream_connection->audio_receiver = NULL;
+	chiaki_audio_receiver_free(stream_connection->haptics_receiver);
+	stream_connection->haptics_receiver = NULL;
 
 	return err;
 }
@@ -696,6 +710,14 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
 
 	stream_connection_send_streaminfo_ack(stream_connection);
 
+	// declaring a DualSense makes the PS5 send the haptics audio stream;
+	// only sent when enabled so PS4-era behavior stays untouched
+	if(stream_connection->session->connect_info.enable_dualsense)
+	{
+		if(stream_connection_send_controller_connection(stream_connection) != CHIAKI_ERR_SUCCESS)
+			CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send controller connection");
+	}
+
 	// stream_connection->state_mutex is expected to be locked by the caller of this function
 	stream_connection->state_finished = true;
 	chiaki_cond_signal(&stream_connection->state_cond);
@@ -832,6 +854,38 @@ static ChiakiErrorCode stream_connection_send_streaminfo_ack(ChiakiStreamConnect
 	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 9, buf, buf_size, NULL);
 }
 
+// Declare the connected controller to the console. BOND is the DualSense
+// (its codename in this protocol generation); declaring it is what makes a
+// PS5 start sending the haptics audio stream. Ported from chiaki-ng.
+static ChiakiErrorCode stream_connection_send_controller_connection(ChiakiStreamConnection *stream_connection)
+{
+	tkproto_TakionMessage msg;
+	memset(&msg, 0, sizeof(msg));
+
+	msg.type = tkproto_TakionMessage_PayloadType_CONTROLLERCONNECTION;
+	msg.has_controller_connection_payload = true;
+	msg.controller_connection_payload.has_connected = true;
+	msg.controller_connection_payload.connected = true;
+	msg.controller_connection_payload.has_controller_id = false;
+	msg.controller_connection_payload.has_controller_type = true;
+	msg.controller_connection_payload.controller_type =
+		tkproto_ControllerConnectionPayload_ControllerType_BOND;
+
+	uint8_t buf[2048];
+	size_t buf_size;
+
+	pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+	bool pbr = pb_encode(&stream, tkproto_TakionMessage_fields, &msg);
+	if(!pbr)
+	{
+		CHIAKI_LOGE(stream_connection->log, "StreamConnection controller connection protobuf encoding failed");
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	buf_size = stream.bytes_written;
+	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 1, buf, buf_size, NULL);
+}
+
 static ChiakiErrorCode stream_connection_send_disconnect(ChiakiStreamConnection *stream_connection)
 {
 	tkproto_TakionMessage msg;
@@ -867,6 +921,8 @@ static void stream_connection_takion_av(ChiakiStreamConnection *stream_connectio
 
 	if(packet->is_video)
 		chiaki_video_receiver_av_packet(stream_connection->video_receiver, packet);
+	else if(packet->is_haptics)
+		chiaki_audio_receiver_av_packet(stream_connection->haptics_receiver, packet);
 	else
 		chiaki_audio_receiver_av_packet(stream_connection->audio_receiver, packet);
 }

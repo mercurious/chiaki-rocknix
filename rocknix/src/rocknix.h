@@ -31,6 +31,7 @@ typedef struct rknx_config_t
 	char codec[8];      // h264 or h265 (h265 only valid for PS5)
 	char decoder[32];   // empty/"software", an AVHWDeviceType name, or a decoder name like h264_v4l2m2m
 	double audio_boost; // 1.0 = passthrough
+	char haptics[8];    // off/weak/normal/strong -- PS5 haptics-to-rumble intensity
 } RknxConfig;
 
 void rknx_config_defaults(RknxConfig *cfg);

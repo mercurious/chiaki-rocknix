@@ -47,6 +47,7 @@ typedef struct chiaki_takion_av_packet_t
 	uint64_t key_pos;
 
 	uint8_t byte_before_audio_data;
+	bool is_haptics; // v12 audio packets carrying DualSense haptics instead of sound
 
 	uint8_t *data; // not owned
 	size_t data_size;
