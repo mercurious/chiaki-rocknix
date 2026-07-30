@@ -96,11 +96,17 @@ typedef struct stream_ctx
 	double audio_boost;
 	const char *login_pin;
 	atomic_bool session_quit;
+	atomic_bool frame_pending;
+	atomic_int quit_reason;
 } StreamCtx;
 
 static void frame_available_cb(ChiakiFfmpegDecoder *decoder, void *user)
 {
 	StreamCtx *ctx = user;
+	// coalesce: at most one FRAME event in flight — pull_frame always drains
+	// to the latest frame, so queueing more would only back up the loop
+	if(atomic_exchange(&ctx->frame_pending, true))
+		return;
 	SDL_Event ev = { 0 };
 	ev.type = ctx->sdl_event_base;
 	ev.user.code = RKNX_EVENT_FRAME;
@@ -145,6 +151,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 			CHIAKI_LOGI(ctx->log, "Session quit: %s (%s)",
 				chiaki_quit_reason_string(event->quit.reason),
 				event->quit.reason_str ? event->quit.reason_str : "-");
+			atomic_store(&ctx->quit_reason, (int)event->quit.reason);
 			atomic_store(&ctx->session_quit, true);
 			SDL_Event ev = { 0 };
 			ev.type = ctx->sdl_event_base;
@@ -306,6 +313,7 @@ typedef struct pad_state
 {
 	SDL_GameController *controller;
 	Uint32 guide_down_at; // 0 = not held
+	Uint32 combo_down_at; // Select+Start held together; 0 = not held
 	Uint32 ps_pulse_until;
 } PadState;
 
@@ -377,6 +385,22 @@ static bool pad_read(PadState *pad, ChiakiControllerState *state)
 		state->buttons |= CHIAKI_CONTROLLER_BUTTON_PS;
 	else
 		pad->ps_pulse_until = 0;
+
+	// Fallback quit: hold Select+Start. Needed because ROCKNIX's InputPlumber
+	// virtual pad may swallow Guide for system hotkeys before SDL sees it.
+	// While the combo is held, its individual bits are suppressed so a quit
+	// never pops the console's touchpad/options actions first.
+	if(SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_BACK)
+		&& SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_START))
+	{
+		state->buttons &= ~(uint32_t)(CHIAKI_CONTROLLER_BUTTON_TOUCHPAD | CHIAKI_CONTROLLER_BUTTON_OPTIONS);
+		if(!pad->combo_down_at)
+			pad->combo_down_at = now ? now : 1;
+		else if(now - pad->combo_down_at >= GUIDE_QUIT_HOLD_MS)
+			return true;
+	}
+	else
+		pad->combo_down_at = 0;
 
 	return false;
 }
@@ -517,6 +541,8 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	ctx.login_pin = arguments.login_pin;
 	ctx.sdl_event_base = SDL_RegisterEvents(1);
 	atomic_init(&ctx.session_quit, false);
+	atomic_init(&ctx.frame_pending, false);
+	atomic_init(&ctx.quit_reason, (int)CHIAKI_QUIT_REASON_NONE);
 
 	ChiakiConnectVideoProfile profile;
 	chiaki_connect_video_profile_preset(&profile, parse_resolution(cfg.resolution),
@@ -554,7 +580,11 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 		return 1;
 	}
 	VideoOut vid = { 0 };
-	vid.renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+	// no PRESENTVSYNC: on Wayland a vsynced present blocks on frame callbacks,
+	// which the compositor withholds while the surface is occluded (e.g. ES
+	// fullscreen on top) — that deadlocks the whole event loop and backs up
+	// the decoder. Pacing comes from the 60fps stream itself.
+	vid.renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
 	if(!vid.renderer)
 		vid.renderer = SDL_CreateRenderer(window, -1, 0);
 	if(!vid.renderer)
@@ -644,6 +674,9 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 					switch(event.user.code)
 					{
 						case RKNX_EVENT_FRAME:
+							// clear BEFORE pulling: a frame decoded during
+							// present re-arms the event instead of being lost
+							atomic_store(&ctx.frame_pending, false);
 							video_present(&vid, &ctx.video_decoder, log);
 							break;
 						case RKNX_EVENT_RUMBLE:
@@ -685,6 +718,14 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	SDL_DestroyRenderer(vid.renderer);
 	SDL_DestroyWindow(window);
 	SDL_Quit();
+
+	// honest exit status: launchers keep their terminal open on failure so
+	// the quit reason (e.g. "Remote Play on Console is already in use") is
+	// readable instead of flashing past
+	ChiakiQuitReason reason = (ChiakiQuitReason)atomic_load(&ctx.quit_reason);
+	bool session_ended_itself = atomic_load(&ctx.session_quit);
+	if(session_ended_itself && reason != CHIAKI_QUIT_REASON_NONE && reason != CHIAKI_QUIT_REASON_STOPPED)
+		return 2;
 	return 0;
 }
 
