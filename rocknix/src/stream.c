@@ -170,7 +170,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 	{
 		case CHIAKI_EVENT_CONNECTED:
 			CHIAKI_LOGI(ctx->log, "Session connected");
-			notify_user("Connected: %s", ctx->profile_desc);
+			notify_user("%s", ctx->profile_desc);
 			break;
 		case CHIAKI_EVENT_LOGIN_PIN_REQUEST:
 			if(ctx->login_pin)
@@ -189,6 +189,16 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 			break;
 		case CHIAKI_EVENT_RUMBLE:
 		{
+			// one-time confirmation that the console actually emits classic
+			// rumble events over this session (PS5 titles on advanced haptics
+			// may never send any — that needs chiaki-ng-style conversion)
+			static bool rumble_seen = false;
+			if(!rumble_seen)
+			{
+				rumble_seen = true;
+				CHIAKI_LOGI(ctx->log, "Rumble events flowing from console (l=%u r=%u)",
+					event->rumble.left, event->rumble.right);
+			}
 			SDL_Event ev = { 0 };
 			ev.type = ctx->sdl_event_base;
 			ev.user.code = RKNX_EVENT_RUMBLE;
@@ -398,12 +408,6 @@ static void pad_open_first(PadState *pad, ChiakiLog *log)
 			return;
 		}
 	}
-}
-
-static void pad_rumble_ack(PadState *pad)
-{
-	if(pad->controller)
-		SDL_GameControllerRumble(pad->controller, 0xFFFF, 0xFFFF, 150);
 }
 
 // Chord helper: while BOTH buttons are held their bits are stripped from the
@@ -901,7 +905,7 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 			in_use_retries++;
 			CHIAKI_LOGW(log, "Console still holds a previous session, retrying (%d/6) in 2.5s", in_use_retries);
 			if(in_use_retries == 1)
-				notify_user("Console is freeing the previous session...");
+				notify_user("Console Reconnecting");
 			usleep(2500 * 1000);
 			restart = true;
 			continue;
@@ -915,9 +919,8 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 				bool to_1080 = strcmp(cfg.resolution, "1080p") != 0;
 				snprintf(cfg.resolution, sizeof(cfg.resolution), "%s", to_1080 ? "1080p" : "720p");
 				CHIAKI_LOGI(log, "Toggling resolution -> %s, reconnecting", cfg.resolution);
-				notify_user("Switching to %s -- reconnecting, hold tight...", cfg.resolution);
+				notify_user("%s", cfg.resolution);
 				rknx_config_save(&cfg, config_path, log);
-				pad_rumble_ack(&pad);
 				restart = true;
 				break;
 			}
@@ -926,30 +929,53 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 				if(!chiaki_target_is_ps5((ChiakiTarget)cfg.target))
 				{
 					CHIAKI_LOGW(log, "Codec toggle ignored: PS4 streams are h264 only");
-					notify_user("PS4 streams are h264 only");
+					notify_user("PS4: h264 only");
 					restart = true; // keep streaming
 					break;
 				}
 				bool to_h265 = strcmp(cfg.codec, "h265") != 0;
 				snprintf(cfg.codec, sizeof(cfg.codec), "%s", to_h265 ? "h265" : "h264");
 				CHIAKI_LOGI(log, "Toggling codec -> %s, reconnecting", cfg.codec);
-				notify_user("Switching codec to %s -- reconnecting, hold tight...", cfg.codec);
+				notify_user("Codec: %s", cfg.codec);
 				rknx_config_save(&cfg, config_path, log);
-				pad_rumble_ack(&pad);
 				restart = true;
 				break;
 			}
 			case PAD_ACTION_QUIT:
 			default:
 			{
-				// honest exit status: launchers keep their terminal open on
-				// failure so the quit reason (e.g. "Remote Play on Console is
-				// already in use") is readable instead of flashing past
+				// The rig is gamepad-only: quit reasons are surfaced as toasts,
+				// never as terminal prompts. The console ending the session
+				// itself (rest mode, RP switched off) is a NORMAL exit — only
+				// genuinely actionable failures exit non-zero.
 				ChiakiQuitReason reason = (ChiakiQuitReason)atomic_load(&ctx.quit_reason);
 				bool session_ended_itself = atomic_load(&ctx.session_quit);
-				if(ending == PAD_ACTION_NONE && session_ended_itself
-					&& reason != CHIAKI_QUIT_REASON_NONE && reason != CHIAKI_QUIT_REASON_STOPPED)
-					exit_code = 2;
+				if(ending == PAD_ACTION_NONE && session_ended_itself)
+				{
+					switch(reason)
+					{
+						case CHIAKI_QUIT_REASON_NONE:
+						case CHIAKI_QUIT_REASON_STOPPED:
+							break;
+						case CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED:
+							notify_user("Console Sleeping");
+							break;
+						case CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE:
+							notify_user("Console Busy");
+							exit_code = 2;
+							break;
+						case CHIAKI_QUIT_REASON_SESSION_REQUEST_CONNECTION_REFUSED:
+						case CHIAKI_QUIT_REASON_CTRL_CONNECT_FAILED:
+						case CHIAKI_QUIT_REASON_CTRL_CONNECTION_REFUSED:
+							notify_user("Console Unreachable");
+							exit_code = 2;
+							break;
+						default:
+							notify_user("%s", chiaki_quit_reason_string(reason));
+							exit_code = 2;
+							break;
+					}
+				}
 				break;
 			}
 		}
