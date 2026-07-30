@@ -609,6 +609,11 @@ static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
 	atomic_store(&ctx->frame_pending, false);
 	atomic_store(&ctx->quit_reason, (int)CHIAKI_QUIT_REASON_NONE);
 
+	// drain events left over from a previous session — its teardown-time
+	// QUIT event would otherwise kill this session on the first tick
+	SDL_PumpEvents();
+	SDL_FlushEvent(ctx->sdl_event_base);
+
 	ChiakiErrorCode err = chiaki_ffmpeg_decoder_init(&ctx->video_decoder, log,
 		profile.codec, decoder_name, frame_available_cb, ctx);
 	if(err != CHIAKI_ERR_SUCCESS)
