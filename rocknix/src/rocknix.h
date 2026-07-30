@@ -32,6 +32,7 @@ typedef struct rknx_config_t
 	char decoder[32];   // empty/"software", an AVHWDeviceType name, or a decoder name like h264_v4l2m2m
 	double audio_boost; // 1.0 = passthrough
 	char haptics[8];    // off/weak/normal/strong -- PS5 haptics-to-rumble intensity
+	double trigger_deadzone; // 0..0.4 fraction; rest-hysteresis filter (Flip 2 L2 rests ~5% after use)
 } RknxConfig;
 
 void rknx_config_defaults(RknxConfig *cfg);

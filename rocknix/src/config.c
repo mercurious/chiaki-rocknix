@@ -27,6 +27,7 @@ void rknx_config_defaults(RknxConfig *cfg)
 	cfg->decoder[0] = '\0';
 	cfg->audio_boost = 1.0;
 	snprintf(cfg->haptics, sizeof(cfg->haptics), "normal");
+	cfg->trigger_deadzone = 0.10;
 }
 
 void rknx_config_default_path(char *buf, size_t buf_size)
@@ -119,6 +120,12 @@ int rknx_config_load(RknxConfig *cfg, const char *path, ChiakiLog *log)
 			cfg->audio_boost = atof(val);
 		else if(!strcmp(key, "haptics"))
 			snprintf(cfg->haptics, sizeof(cfg->haptics), "%s", val);
+		else if(!strcmp(key, "trigger_deadzone"))
+		{
+			cfg->trigger_deadzone = atof(val);
+			if(cfg->trigger_deadzone < 0.0 || cfg->trigger_deadzone > 0.4)
+				cfg->trigger_deadzone = 0.10;
+		}
 		else
 			CHIAKI_LOGW(log, "Unknown config key \"%s\"", key);
 	}
@@ -185,11 +192,12 @@ int rknx_config_save(const RknxConfig *cfg, const char *path, ChiakiLog *log)
 		"codec = %s\n"
 		"decoder = %s\n"
 		"audio_boost = %.2f\n"
-		"haptics = %s\n",
+		"haptics = %s\n"
+		"trigger_deadzone = %.2f\n",
 		cfg->host_addr, cfg->nickname, cfg->target, cfg->psn_account_id_b64,
 		regist_key_b64, rp_key_b64,
 		cfg->resolution, cfg->fps, cfg->codec, cfg->decoder, cfg->audio_boost,
-		cfg->haptics);
+		cfg->haptics, cfg->trigger_deadzone);
 	fclose(f);
 	if(chmod(tmp_path, 0600) < 0 || rename(tmp_path, path) < 0)
 	{

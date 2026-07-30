@@ -436,7 +436,22 @@ typedef struct pad_state
 	Uint32 l1r3_down_at;  // L1+R3 codec chord
 	bool r1l3_armed;      // require full release between chord fires
 	bool l1r3_armed;
+	int trigger_dz;       // deadzone in SDL axis units (0..32767)
 } PadState;
+
+// The Flip 2's virtual DualSense declares its trigger axes with fuzz=0
+// flat=0 and they REST off zero after the first pull (measured: L2 at
+// 12/255 ~ 5%) — without a client-side deadzone that residual streams to
+// the console as permanent brake/throttle drag. Rescaled so the deadzone
+// never costs the top of the range.
+static uint8_t trigger_value(Sint16 axis, int dz)
+{
+	int v = axis;
+	if(v <= dz)
+		return 0;
+	int scaled = (v - dz) * 255 / (32767 - dz);
+	return scaled > 255 ? 255 : (uint8_t)scaled;
+}
 
 static void pad_open_first(PadState *pad, ChiakiLog *log)
 {
@@ -506,8 +521,8 @@ static PadAction pad_read(PadState *pad, ChiakiControllerState *state)
 	state->buttons |= SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_START) ? CHIAKI_CONTROLLER_BUTTON_OPTIONS : 0;
 	// on a handheld the touchpad click is worth more than Share
 	state->buttons |= SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_BACK) ? CHIAKI_CONTROLLER_BUTTON_TOUCHPAD : 0;
-	state->l2_state = (uint8_t)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
-	state->r2_state = (uint8_t)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
+	state->l2_state = trigger_value(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT), pad->trigger_dz);
+	state->r2_state = trigger_value(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT), pad->trigger_dz);
 	state->left_x = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
 	state->left_y = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY);
 	state->right_x = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
@@ -966,7 +981,9 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	sigaction(SIGUSR2, &sa, NULL);
 
 	PadState pad = { 0 };
+	pad.trigger_dz = (int)(cfg.trigger_deadzone * 32767.0);
 	pad_open_first(&pad, log);
+	CHIAKI_LOGI(log, "Trigger deadzone: %d%%", (int)(cfg.trigger_deadzone * 100.0));
 
 	int exit_code = 0;
 	int in_use_retries = 0;
