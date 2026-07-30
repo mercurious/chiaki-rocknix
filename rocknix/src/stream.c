@@ -3,6 +3,11 @@
 // SDL2 streaming client for embedded Linux (ROCKNIX / Wayland).
 // Session wiring follows switch/src/host.cpp, audio follows switch/src/io.cpp,
 // controller mapping follows gui/src/controllermanager.cpp.
+//
+// Resolution/codec are fixed at session negotiation by the Remote Play
+// protocol, so the in-stream toggle chords (R1+L3 resolution, L1+R3 codec)
+// persist the config and restart the session in place — the window stays up
+// and the stream returns on the new profile after a few seconds.
 
 #include "rocknix.h"
 
@@ -24,17 +29,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-// SIGINT/SIGTERM must end the session cleanly (chiaki_session_stop says
-// goodbye to the console) — a hard kill leaves the console thinking Remote
-// Play is still in use and the next connect fails with 0x80108b10.
-static volatile sig_atomic_t g_signal_quit = 0;
-
-static void signal_handler(int sig)
-{
-	(void)sig;
-	g_signal_quit = 1;
-}
 
 static char doc[] = "Stream from the registered console (pair with `chiaki regist` first).";
 
@@ -87,6 +81,27 @@ static int parse_opt(int key, char *arg, struct argp_state *state)
 }
 
 static struct argp argp = { options, parse_opt, 0, doc, 0, 0, 0 };
+
+// ---- signals ----------------------------------------------------------------
+
+// SIGINT/SIGTERM must end the session cleanly (chiaki_session_stop says
+// goodbye to the console) — a hard kill leaves the console thinking Remote
+// Play is still in use and the next connect fails with 0x80108b10.
+// SIGUSR1/SIGUSR2 mirror the resolution/codec toggle chords for external
+// triggers (ssh testing, future etk integration).
+static volatile sig_atomic_t g_signal_quit = 0;
+static volatile sig_atomic_t g_signal_toggle_res = 0;
+static volatile sig_atomic_t g_signal_toggle_codec = 0;
+
+static void signal_handler(int sig)
+{
+	switch(sig)
+	{
+		case SIGUSR1: g_signal_toggle_res = 1; break;
+		case SIGUSR2: g_signal_toggle_codec = 1; break;
+		default: g_signal_quit = 1; break;
+	}
+}
 
 // ---- custom SDL events -----------------------------------------------------
 
@@ -320,6 +335,15 @@ static void ensure_awake(ChiakiLog *log, const RknxConfig *cfg)
 #define GUIDE_QUIT_HOLD_MS 1500
 #define GUIDE_TAP_MS 400
 #define PS_PULSE_MS 120
+#define CHORD_HOLD_MS 600
+
+typedef enum pad_action
+{
+	PAD_ACTION_NONE = 0,
+	PAD_ACTION_QUIT,
+	PAD_ACTION_TOGGLE_RES,
+	PAD_ACTION_TOGGLE_CODEC,
+} PadAction;
 
 typedef struct pad_state
 {
@@ -327,6 +351,10 @@ typedef struct pad_state
 	Uint32 guide_down_at; // 0 = not held
 	Uint32 combo_down_at; // Select+Start held together; 0 = not held
 	Uint32 ps_pulse_until;
+	Uint32 r1l3_down_at;  // R1+L3 resolution chord
+	Uint32 l1r3_down_at;  // L1+R3 codec chord
+	bool r1l3_armed;      // require full release between chord fires
+	bool l1r3_armed;
 } PadState;
 
 static void pad_open_first(PadState *pad, ChiakiLog *log)
@@ -341,18 +369,52 @@ static void pad_open_first(PadState *pad, ChiakiLog *log)
 		if(pad->controller)
 		{
 			CHIAKI_LOGI(log, "Using controller: %s", SDL_GameControllerName(pad->controller));
+			pad->r1l3_armed = true;
+			pad->l1r3_armed = true;
 			return;
 		}
 	}
 }
 
-// returns true if the quit gesture (hold Guide) fired
-static bool pad_read(PadState *pad, ChiakiControllerState *state)
+static void pad_rumble_ack(PadState *pad)
+{
+	if(pad->controller)
+		SDL_GameControllerRumble(pad->controller, 0xFFFF, 0xFFFF, 150);
+}
+
+// Chord helper: while BOTH buttons are held their bits are stripped from the
+// state (the console never sees the chord), and after CHORD_HOLD_MS the
+// action fires once — re-armed only when the chord is fully released.
+static bool chord_check(ChiakiControllerState *state, Uint32 now,
+		bool a_down, bool b_down, uint32_t suppress_mask,
+		Uint32 *down_at, bool *armed)
+{
+	if(a_down && b_down)
+	{
+		state->buttons &= ~suppress_mask;
+		if(!*down_at)
+			*down_at = now ? now : 1;
+		else if(*armed && now - *down_at >= CHORD_HOLD_MS)
+		{
+			*armed = false;
+			return true;
+		}
+	}
+	else
+	{
+		*down_at = 0;
+		if(!a_down && !b_down)
+			*armed = true;
+	}
+	return false;
+}
+
+static PadAction pad_read(PadState *pad, ChiakiControllerState *state)
 {
 	chiaki_controller_state_set_idle(state);
 	SDL_GameController *c = pad->controller;
 	if(!c)
-		return false;
+		return PAD_ACTION_NONE;
 
 	state->buttons |= SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A) ? CHIAKI_CONTROLLER_BUTTON_CROSS : 0;
 	state->buttons |= SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_B) ? CHIAKI_CONTROLLER_BUTTON_MOON : 0;
@@ -385,7 +447,7 @@ static bool pad_read(PadState *pad, ChiakiControllerState *state)
 		if(!pad->guide_down_at)
 			pad->guide_down_at = now ? now : 1;
 		else if(now - pad->guide_down_at >= GUIDE_QUIT_HOLD_MS)
-			return true;
+			return PAD_ACTION_QUIT;
 	}
 	else if(pad->guide_down_at)
 	{
@@ -409,12 +471,28 @@ static bool pad_read(PadState *pad, ChiakiControllerState *state)
 		if(!pad->combo_down_at)
 			pad->combo_down_at = now ? now : 1;
 		else if(now - pad->combo_down_at >= GUIDE_QUIT_HOLD_MS)
-			return true;
+			return PAD_ACTION_QUIT;
 	}
 	else
 		pad->combo_down_at = 0;
 
-	return false;
+	// In-stream setting chords (etk's input_d stands down while a stream is
+	// active, so these are exclusively ours here):
+	//   R1+L3 = toggle resolution, L1+R3 = toggle codec.
+	if(chord_check(state, now,
+			SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER),
+			SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSTICK),
+			CHIAKI_CONTROLLER_BUTTON_R1 | CHIAKI_CONTROLLER_BUTTON_L3,
+			&pad->r1l3_down_at, &pad->r1l3_armed))
+		return PAD_ACTION_TOGGLE_RES;
+	if(chord_check(state, now,
+			SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER),
+			SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSTICK),
+			CHIAKI_CONTROLLER_BUTTON_L1 | CHIAKI_CONTROLLER_BUTTON_R3,
+			&pad->l1r3_down_at, &pad->l1r3_armed))
+		return PAD_ACTION_TOGGLE_CODEC;
+
+	return PAD_ACTION_NONE;
 }
 
 // ---- video -----------------------------------------------------------------
@@ -502,6 +580,180 @@ static ChiakiVideoResolutionPreset parse_resolution(const char *s)
 	return CHIAKI_VIDEO_RESOLUTION_PRESET_720p;
 }
 
+// one full session: connect, stream until quit/toggle, tear down.
+// Returns the PadAction that ended it (NONE = session ended on its own).
+static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
+		PadState *pad, ChiakiLog *log, bool *session_failed)
+{
+	*session_failed = false;
+	bool is_ps5 = chiaki_target_is_ps5((ChiakiTarget)cfg->target);
+
+	ChiakiConnectVideoProfile profile;
+	chiaki_connect_video_profile_preset(&profile, parse_resolution(cfg->resolution),
+		cfg->fps == 30 ? CHIAKI_VIDEO_FPS_PRESET_30 : CHIAKI_VIDEO_FPS_PRESET_60);
+	if(!strcmp(cfg->codec, "h265"))
+	{
+		if(is_ps5)
+			profile.codec = CHIAKI_CODEC_H265;
+		else
+			CHIAKI_LOGW(log, "h265 requested but console is a PS4, keeping h264");
+	}
+	CHIAKI_LOGI(log, "Session profile: %s@%d %s", cfg->resolution, cfg->fps,
+		profile.codec == CHIAKI_CODEC_H265 ? "h265" : "h264");
+
+	const char *decoder_name = cfg->decoder;
+	if(!decoder_name[0] || !strcmp(decoder_name, "software") || !strcmp(decoder_name, "auto"))
+		decoder_name = NULL;
+
+	atomic_store(&ctx->session_quit, false);
+	atomic_store(&ctx->frame_pending, false);
+	atomic_store(&ctx->quit_reason, (int)CHIAKI_QUIT_REASON_NONE);
+
+	ChiakiErrorCode err = chiaki_ffmpeg_decoder_init(&ctx->video_decoder, log,
+		profile.codec, decoder_name, frame_available_cb, ctx);
+	if(err != CHIAKI_ERR_SUCCESS)
+	{
+		CHIAKI_LOGE(log, "Failed to init video decoder (decoder=%s)", decoder_name ? decoder_name : "software");
+		*session_failed = true;
+		return PAD_ACTION_NONE;
+	}
+
+	chiaki_opus_decoder_init(&ctx->opus_decoder, log);
+	ChiakiConnectInfo connect_info = { 0 };
+	connect_info.host = cfg->host_addr;
+	connect_info.ps5 = is_ps5;
+	connect_info.video_profile = profile;
+	connect_info.video_profile_auto_downgrade = true;
+	connect_info.enable_keyboard = false;
+	memcpy(connect_info.regist_key, cfg->rp_regist_key, sizeof(connect_info.regist_key));
+	memcpy(connect_info.morning, cfg->rp_key, sizeof(connect_info.morning));
+
+	err = chiaki_session_init(&ctx->session, &connect_info, log);
+	if(err != CHIAKI_ERR_SUCCESS)
+	{
+		CHIAKI_LOGE(log, "chiaki_session_init failed: %s", chiaki_error_string(err));
+		chiaki_opus_decoder_fini(&ctx->opus_decoder);
+		chiaki_ffmpeg_decoder_fini(&ctx->video_decoder);
+		*session_failed = true;
+		return PAD_ACTION_NONE;
+	}
+	ChiakiAudioSink audio_sink;
+	chiaki_opus_decoder_set_cb(&ctx->opus_decoder, audio_settings_cb, audio_frame_cb, ctx);
+	chiaki_opus_decoder_get_sink(&ctx->opus_decoder, &audio_sink);
+	chiaki_session_set_audio_sink(&ctx->session, &audio_sink);
+	chiaki_session_set_video_sample_cb(&ctx->session, chiaki_ffmpeg_decoder_video_sample_cb, &ctx->video_decoder);
+	chiaki_session_set_event_cb(&ctx->session, session_event_cb, ctx);
+
+	err = chiaki_session_start(&ctx->session);
+	if(err != CHIAKI_ERR_SUCCESS)
+	{
+		CHIAKI_LOGE(log, "chiaki_session_start failed: %s", chiaki_error_string(err));
+		chiaki_session_fini(&ctx->session);
+		chiaki_opus_decoder_fini(&ctx->opus_decoder);
+		chiaki_ffmpeg_decoder_fini(&ctx->video_decoder);
+		*session_failed = true;
+		return PAD_ACTION_NONE;
+	}
+
+	ChiakiControllerState controller_state;
+	chiaki_controller_state_set_idle(&controller_state);
+
+	PadAction ending = PAD_ACTION_NONE;
+	bool running = true;
+	while(running)
+	{
+		SDL_Event event;
+		// ~8ms tick keeps controller feedback at ~120Hz without spinning
+		if(SDL_WaitEventTimeout(&event, 8))
+		{
+			do
+			{
+				if(event.type == SDL_QUIT)
+				{
+					ending = PAD_ACTION_QUIT;
+					running = false;
+				}
+				else if(event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)
+				{
+					ending = PAD_ACTION_QUIT;
+					running = false;
+				}
+				else if(event.type == SDL_CONTROLLERDEVICEADDED)
+					pad_open_first(pad, log);
+				else if(event.type == SDL_CONTROLLERDEVICEREMOVED && pad->controller
+					&& event.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad->controller)))
+				{
+					SDL_GameControllerClose(pad->controller);
+					pad->controller = NULL;
+					pad_open_first(pad, log);
+				}
+				else if(event.type == ctx->sdl_event_base)
+				{
+					switch(event.user.code)
+					{
+						case RKNX_EVENT_FRAME:
+							// clear BEFORE pulling: a frame decoded during
+							// present re-arms the event instead of being lost
+							atomic_store(&ctx->frame_pending, false);
+							video_present(vid, &ctx->video_decoder, log);
+							break;
+						case RKNX_EVENT_RUMBLE:
+							if(pad->controller)
+								SDL_GameControllerRumble(pad->controller,
+									(Uint16)((uintptr_t)event.user.data1 << 8),
+									(Uint16)((uintptr_t)event.user.data2 << 8), 5000);
+							break;
+						case RKNX_EVENT_QUIT:
+							running = false;
+							break;
+					}
+				}
+			} while(SDL_PollEvent(&event));
+		}
+
+		if(g_signal_quit)
+		{
+			CHIAKI_LOGI(log, "Signal received, quitting cleanly");
+			ending = PAD_ACTION_QUIT;
+			running = false;
+		}
+		if(g_signal_toggle_res)
+		{
+			g_signal_toggle_res = 0;
+			ending = PAD_ACTION_TOGGLE_RES;
+			running = false;
+		}
+		if(g_signal_toggle_codec)
+		{
+			g_signal_toggle_codec = 0;
+			ending = PAD_ACTION_TOGGLE_CODEC;
+			running = false;
+		}
+
+		PadAction action = pad_read(pad, &controller_state);
+		if(action != PAD_ACTION_NONE && running)
+		{
+			CHIAKI_LOGI(log, "Pad action %d", (int)action);
+			ending = action;
+			running = false;
+		}
+		chiaki_session_set_controller_state(&ctx->session, &controller_state);
+	}
+
+	CHIAKI_LOGI(log, "Shutting down session");
+	if(!atomic_load(&ctx->session_quit))
+		chiaki_session_stop(&ctx->session);
+	chiaki_session_join(&ctx->session);
+	chiaki_session_fini(&ctx->session);
+	chiaki_opus_decoder_fini(&ctx->opus_decoder);
+	chiaki_ffmpeg_decoder_fini(&ctx->video_decoder);
+
+	// black frame between sessions so a toggle reads as an intentional switch
+	SDL_RenderClear(vid->renderer);
+	SDL_RenderPresent(vid->renderer);
+	return ending;
+}
+
 int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 {
 	Arguments arguments = { 0 };
@@ -533,8 +785,8 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 		snprintf(cfg.decoder, sizeof(cfg.decoder), "%s", arguments.decoder);
 
 	bool is_ps5 = chiaki_target_is_ps5((ChiakiTarget)cfg.target);
-	CHIAKI_LOGI(log, "Streaming from %s (%s, %s) at %s/%dfps", cfg.host_addr,
-		cfg.nickname[0] ? cfg.nickname : "?", is_ps5 ? "PS5" : "PS4", cfg.resolution, cfg.fps);
+	CHIAKI_LOGI(log, "Streaming from %s (%s, %s)", cfg.host_addr,
+		cfg.nickname[0] ? cfg.nickname : "?", is_ps5 ? "PS5" : "PS4");
 
 	if(!arguments.no_wakeup)
 		ensure_awake(log, &cfg);
@@ -556,38 +808,13 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	atomic_init(&ctx.frame_pending, false);
 	atomic_init(&ctx.quit_reason, (int)CHIAKI_QUIT_REASON_NONE);
 
-	ChiakiConnectVideoProfile profile;
-	chiaki_connect_video_profile_preset(&profile, parse_resolution(cfg.resolution),
-		cfg.fps == 30 ? CHIAKI_VIDEO_FPS_PRESET_30 : CHIAKI_VIDEO_FPS_PRESET_60);
-	if(!strcmp(cfg.codec, "h265"))
-	{
-		if(is_ps5)
-			profile.codec = CHIAKI_CODEC_H265;
-		else
-			CHIAKI_LOGW(log, "h265 requested but console is a PS4, keeping h264");
-	}
-
-	const char *decoder_name = cfg.decoder;
-	if(!decoder_name[0] || !strcmp(decoder_name, "software") || !strcmp(decoder_name, "auto"))
-		decoder_name = NULL;
-
-	ChiakiErrorCode err = chiaki_ffmpeg_decoder_init(&ctx.video_decoder, log,
-		profile.codec, decoder_name, frame_available_cb, &ctx);
-	if(err != CHIAKI_ERR_SUCCESS)
-	{
-		fprintf(stderr, "Failed to init video decoder (decoder=%s)\n", decoder_name ? decoder_name : "software");
-		SDL_Quit();
-		return 1;
-	}
-
 	SDL_Window *window = SDL_CreateWindow("Chiaki",
 		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-		(int)profile.width, (int)profile.height,
+		1280, 720,
 		SDL_WINDOW_RESIZABLE | (arguments.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
 	if(!window)
 	{
 		fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-		chiaki_ffmpeg_decoder_fini(&ctx.video_decoder);
 		SDL_Quit();
 		return 1;
 	}
@@ -603,7 +830,6 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	{
 		fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
 		SDL_DestroyWindow(window);
-		chiaki_ffmpeg_decoder_fini(&ctx.video_decoder);
 		SDL_Quit();
 		return 1;
 	}
@@ -611,125 +837,72 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	SDL_RenderClear(vid.renderer);
 	SDL_RenderPresent(vid.renderer);
 
-	// session (wiring as in switch/src/host.cpp InitSession)
-	chiaki_opus_decoder_init(&ctx.opus_decoder, log);
-	ChiakiConnectInfo connect_info = { 0 };
-	connect_info.host = cfg.host_addr;
-	connect_info.ps5 = is_ps5;
-	connect_info.video_profile = profile;
-	connect_info.video_profile_auto_downgrade = true;
-	connect_info.enable_keyboard = false;
-	memcpy(connect_info.regist_key, cfg.rp_regist_key, sizeof(connect_info.regist_key));
-	memcpy(connect_info.morning, cfg.rp_key, sizeof(connect_info.morning));
-
-	err = chiaki_session_init(&ctx.session, &connect_info, log);
-	if(err != CHIAKI_ERR_SUCCESS)
-	{
-		fprintf(stderr, "chiaki_session_init failed: %s\n", chiaki_error_string(err));
-		SDL_DestroyRenderer(vid.renderer);
-		SDL_DestroyWindow(window);
-		chiaki_ffmpeg_decoder_fini(&ctx.video_decoder);
-		chiaki_opus_decoder_fini(&ctx.opus_decoder);
-		SDL_Quit();
-		return 1;
-	}
-	ChiakiAudioSink audio_sink;
-	chiaki_opus_decoder_set_cb(&ctx.opus_decoder, audio_settings_cb, audio_frame_cb, &ctx);
-	chiaki_opus_decoder_get_sink(&ctx.opus_decoder, &audio_sink);
-	chiaki_session_set_audio_sink(&ctx.session, &audio_sink);
-	chiaki_session_set_video_sample_cb(&ctx.session, chiaki_ffmpeg_decoder_video_sample_cb, &ctx.video_decoder);
-	chiaki_session_set_event_cb(&ctx.session, session_event_cb, &ctx);
-
-	err = chiaki_session_start(&ctx.session);
-	if(err != CHIAKI_ERR_SUCCESS)
-	{
-		fprintf(stderr, "chiaki_session_start failed: %s\n", chiaki_error_string(err));
-		chiaki_session_fini(&ctx.session);
-		SDL_DestroyRenderer(vid.renderer);
-		SDL_DestroyWindow(window);
-		chiaki_ffmpeg_decoder_fini(&ctx.video_decoder);
-		chiaki_opus_decoder_fini(&ctx.opus_decoder);
-		SDL_Quit();
-		return 1;
-	}
-
 	struct sigaction sa = { 0 };
 	sa.sa_handler = signal_handler;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGUSR1, &sa, NULL);
+	sigaction(SIGUSR2, &sa, NULL);
 
 	PadState pad = { 0 };
 	pad_open_first(&pad, log);
 
-	ChiakiControllerState controller_state;
-	chiaki_controller_state_set_idle(&controller_state);
-
-	bool running = true;
-	while(running)
+	int exit_code = 0;
+	bool restart = true;
+	while(restart && !g_signal_quit)
 	{
-		SDL_Event event;
-		// ~8ms tick keeps controller feedback at ~120Hz without spinning
-		if(SDL_WaitEventTimeout(&event, 8))
+		restart = false;
+		bool session_failed = false;
+		PadAction ending = run_session(&ctx, &cfg, &vid, &pad, log, &session_failed);
+		if(session_failed)
 		{
-			do
+			exit_code = 1;
+			break;
+		}
+
+		switch(ending)
+		{
+			case PAD_ACTION_TOGGLE_RES:
 			{
-				if(event.type == SDL_QUIT)
-					running = false;
-				else if(event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)
-					running = false;
-				else if(event.type == SDL_CONTROLLERDEVICEADDED)
-					pad_open_first(&pad, log);
-				else if(event.type == SDL_CONTROLLERDEVICEREMOVED && pad.controller
-					&& event.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad.controller)))
+				bool to_1080 = strcmp(cfg.resolution, "1080p") != 0;
+				snprintf(cfg.resolution, sizeof(cfg.resolution), "%s", to_1080 ? "1080p" : "720p");
+				CHIAKI_LOGI(log, "Toggling resolution -> %s, reconnecting", cfg.resolution);
+				rknx_config_save(&cfg, config_path, log);
+				pad_rumble_ack(&pad);
+				restart = true;
+				break;
+			}
+			case PAD_ACTION_TOGGLE_CODEC:
+			{
+				if(!chiaki_target_is_ps5((ChiakiTarget)cfg.target))
 				{
-					SDL_GameControllerClose(pad.controller);
-					pad.controller = NULL;
-					pad_open_first(&pad, log);
+					CHIAKI_LOGW(log, "Codec toggle ignored: PS4 streams are h264 only");
+					restart = true; // keep streaming
+					break;
 				}
-				else if(event.type == ctx.sdl_event_base)
-				{
-					switch(event.user.code)
-					{
-						case RKNX_EVENT_FRAME:
-							// clear BEFORE pulling: a frame decoded during
-							// present re-arms the event instead of being lost
-							atomic_store(&ctx.frame_pending, false);
-							video_present(&vid, &ctx.video_decoder, log);
-							break;
-						case RKNX_EVENT_RUMBLE:
-							if(pad.controller)
-								SDL_GameControllerRumble(pad.controller,
-									(Uint16)((uintptr_t)event.user.data1 << 8),
-									(Uint16)((uintptr_t)event.user.data2 << 8), 5000);
-							break;
-						case RKNX_EVENT_QUIT:
-							running = false;
-							break;
-					}
-				}
-			} while(SDL_PollEvent(&event));
+				bool to_h265 = strcmp(cfg.codec, "h265") != 0;
+				snprintf(cfg.codec, sizeof(cfg.codec), "%s", to_h265 ? "h265" : "h264");
+				CHIAKI_LOGI(log, "Toggling codec -> %s, reconnecting", cfg.codec);
+				rknx_config_save(&cfg, config_path, log);
+				pad_rumble_ack(&pad);
+				restart = true;
+				break;
+			}
+			case PAD_ACTION_QUIT:
+			default:
+			{
+				// honest exit status: launchers keep their terminal open on
+				// failure so the quit reason (e.g. "Remote Play on Console is
+				// already in use") is readable instead of flashing past
+				ChiakiQuitReason reason = (ChiakiQuitReason)atomic_load(&ctx.quit_reason);
+				bool session_ended_itself = atomic_load(&ctx.session_quit);
+				if(ending == PAD_ACTION_NONE && session_ended_itself
+					&& reason != CHIAKI_QUIT_REASON_NONE && reason != CHIAKI_QUIT_REASON_STOPPED)
+					exit_code = 2;
+				break;
+			}
 		}
-
-		if(g_signal_quit)
-		{
-			CHIAKI_LOGI(log, "Signal received, quitting cleanly");
-			running = false;
-		}
-		if(pad_read(&pad, &controller_state))
-		{
-			CHIAKI_LOGI(log, "Quit gesture held");
-			running = false;
-		}
-		chiaki_session_set_controller_state(&ctx.session, &controller_state);
 	}
-
-	CHIAKI_LOGI(log, "Shutting down session");
-	if(!atomic_load(&ctx.session_quit))
-		chiaki_session_stop(&ctx.session);
-	chiaki_session_join(&ctx.session);
-	chiaki_session_fini(&ctx.session);
-	chiaki_opus_decoder_fini(&ctx.opus_decoder);
-	chiaki_ffmpeg_decoder_fini(&ctx.video_decoder);
 
 	if(pad.controller)
 		SDL_GameControllerClose(pad.controller);
@@ -740,15 +913,7 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 	SDL_DestroyRenderer(vid.renderer);
 	SDL_DestroyWindow(window);
 	SDL_Quit();
-
-	// honest exit status: launchers keep their terminal open on failure so
-	// the quit reason (e.g. "Remote Play on Console is already in use") is
-	// readable instead of flashing past
-	ChiakiQuitReason reason = (ChiakiQuitReason)atomic_load(&ctx.quit_reason);
-	bool session_ended_itself = atomic_load(&ctx.session_quit);
-	if(session_ended_itself && reason != CHIAKI_QUIT_REASON_NONE && reason != CHIAKI_QUIT_REASON_STOPPED)
-		return 2;
-	return 0;
+	return exit_code;
 }
 
 int rknx_cmd_list(ChiakiLog *log, int argc, char *argv[])
