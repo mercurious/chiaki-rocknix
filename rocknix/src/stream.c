@@ -24,11 +24,33 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+// ---- user notification hook --------------------------------------------------
+// CHIAKI_NOTIFY_CMD (optional, set by the launcher — on ROCKNIX/etk it points
+// at a mako toast helper) is invoked with the message as $1 whenever the
+// stream state changes in a user-visible way. Fail-silent and non-blocking.
+static void notify_user(const char *fmt, ...)
+{
+	const char *cmd = getenv("CHIAKI_NOTIFY_CMD");
+	if(!cmd || !*cmd)
+		return;
+	char msg[192];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+	char full[512];
+	// messages are our own fixed strings (never remote/user input)
+	snprintf(full, sizeof(full), "'%s' '%s' >/dev/null 2>&1 &", cmd, msg);
+	int r = system(full);
+	(void)r;
+}
 
 static char doc[] = "Stream from the registered console (pair with `chiaki regist` first).";
 
@@ -122,6 +144,7 @@ typedef struct stream_ctx
 	SDL_AudioDeviceID audio_device;
 	double audio_boost;
 	const char *login_pin;
+	char profile_desc[32]; // e.g. "1080p@60 h265", for the connected toast
 	atomic_bool session_quit;
 	atomic_bool frame_pending;
 	atomic_int quit_reason;
@@ -147,6 +170,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 	{
 		case CHIAKI_EVENT_CONNECTED:
 			CHIAKI_LOGI(ctx->log, "Session connected");
+			notify_user("Connected: %s", ctx->profile_desc);
 			break;
 		case CHIAKI_EVENT_LOGIN_PIN_REQUEST:
 			if(ctx->login_pin)
@@ -598,8 +622,9 @@ static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
 		else
 			CHIAKI_LOGW(log, "h265 requested but console is a PS4, keeping h264");
 	}
-	CHIAKI_LOGI(log, "Session profile: %s@%d %s", cfg->resolution, cfg->fps,
+	snprintf(ctx->profile_desc, sizeof(ctx->profile_desc), "%s@%d %s", cfg->resolution, cfg->fps,
 		profile.codec == CHIAKI_CODEC_H265 ? "h265" : "h264");
+	CHIAKI_LOGI(log, "Session profile: %s", ctx->profile_desc);
 
 	const char *decoder_name = cfg->decoder;
 	if(!decoder_name[0] || !strcmp(decoder_name, "software") || !strcmp(decoder_name, "auto"))
@@ -875,6 +900,8 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 		{
 			in_use_retries++;
 			CHIAKI_LOGW(log, "Console still holds a previous session, retrying (%d/6) in 2.5s", in_use_retries);
+			if(in_use_retries == 1)
+				notify_user("Console is freeing the previous session...");
 			usleep(2500 * 1000);
 			restart = true;
 			continue;
@@ -888,6 +915,7 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 				bool to_1080 = strcmp(cfg.resolution, "1080p") != 0;
 				snprintf(cfg.resolution, sizeof(cfg.resolution), "%s", to_1080 ? "1080p" : "720p");
 				CHIAKI_LOGI(log, "Toggling resolution -> %s, reconnecting", cfg.resolution);
+				notify_user("Switching to %s -- reconnecting, hold tight...", cfg.resolution);
 				rknx_config_save(&cfg, config_path, log);
 				pad_rumble_ack(&pad);
 				restart = true;
@@ -898,12 +926,14 @@ int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[])
 				if(!chiaki_target_is_ps5((ChiakiTarget)cfg.target))
 				{
 					CHIAKI_LOGW(log, "Codec toggle ignored: PS4 streams are h264 only");
+					notify_user("PS4 streams are h264 only");
 					restart = true; // keep streaming
 					break;
 				}
 				bool to_h265 = strcmp(cfg.codec, "h265") != 0;
 				snprintf(cfg.codec, sizeof(cfg.codec), "%s", to_h265 ? "h265" : "h264");
 				CHIAKI_LOGI(log, "Toggling codec -> %s, reconnecting", cfg.codec);
+				notify_user("Switching codec to %s -- reconnecting, hold tight...", cfg.codec);
 				rknx_config_save(&cfg, config_path, log);
 				pad_rumble_ack(&pad);
 				restart = true;
