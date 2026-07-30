@@ -18,6 +18,7 @@ static const char doc[] =
 	"Supported commands are:\n"
 	"  stream      Stream from the registered console (default).\n"
 	"  regist      Pair with a console using the Remote Play PIN.\n"
+	"  scan        Find consoles on the LAN (parseable output).\n"
 	"  discover    Discover consoles.\n"
 	"  wakeup      Send a wakeup packet.\n"
 	"  list        Show the current configuration.\n";
@@ -69,6 +70,8 @@ static int parse_opt(int key, char *arg, struct argp_state *state)
 				exit(call_subcmd(state, "stream", rknx_cmd_stream));
 			else if(strcmp(arg, "regist") == 0)
 				exit(call_subcmd(state, "regist", rknx_cmd_regist));
+			else if(strcmp(arg, "scan") == 0)
+				exit(call_subcmd(state, "scan", rknx_cmd_scan));
 			else if(strcmp(arg, "discover") == 0)
 				exit(call_subcmd(state, "discover", chiaki_cli_cmd_discover));
 			else if(strcmp(arg, "wakeup") == 0)

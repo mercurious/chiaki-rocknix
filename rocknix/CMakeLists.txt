@@ -16,6 +16,7 @@ add_executable(chiaki-rocknix
 	src/main.c
 	src/config.c
 	src/regist.c
+	src/scan.c
 	src/stream.c)
 
 # explicit m: libopus may be linked statically and needs libm at final link

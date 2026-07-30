@@ -43,6 +43,7 @@ int rknx_config_save(const RknxConfig *cfg, const char *path, ChiakiLog *log);
 int rknx_cmd_regist(ChiakiLog *log, int argc, char *argv[]);
 int rknx_cmd_stream(ChiakiLog *log, int argc, char *argv[]);
 int rknx_cmd_list(ChiakiLog *log, int argc, char *argv[]);
+int rknx_cmd_scan(ChiakiLog *log, int argc, char *argv[]);
 
 #ifdef __cplusplus
 }
