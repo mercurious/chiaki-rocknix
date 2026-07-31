@@ -33,6 +33,7 @@ typedef struct rknx_config_t
 	double audio_boost; // 1.0 = passthrough
 	char haptics[8];    // off/weak/normal/strong -- PS5 haptics-to-rumble intensity
 	double trigger_deadzone; // 0..0.4 fraction; rest-hysteresis filter (Flip 2 L2 rests ~5% after use)
+	char bitrate[8];    // auto (preset default) / low (50%) / medium (75%) / high (150%, cap 30M)
 } RknxConfig;
 
 void rknx_config_defaults(RknxConfig *cfg);

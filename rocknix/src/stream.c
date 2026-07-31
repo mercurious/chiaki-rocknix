@@ -688,9 +688,23 @@ static PadAction run_session(StreamCtx *ctx, RknxConfig *cfg, VideoOut *vid,
 		else
 			CHIAKI_LOGW(log, "h265 requested but console is a PS4, keeping h264");
 	}
+	// bitrate tiers scale the preset (auto = leave it to the preset/console);
+	// "high" is for clean LANs, capped where the encoder stops cooperating
+	if(!strcmp(cfg->bitrate, "low"))
+		profile.bitrate = profile.bitrate / 2;
+	else if(!strcmp(cfg->bitrate, "medium"))
+		profile.bitrate = profile.bitrate * 3 / 4;
+	else if(!strcmp(cfg->bitrate, "high"))
+	{
+		profile.bitrate = profile.bitrate * 3 / 2;
+		if(profile.bitrate > 30000)
+			profile.bitrate = 30000;
+	}
+
 	snprintf(ctx->profile_desc, sizeof(ctx->profile_desc), "%s@%d %s", cfg->resolution, cfg->fps,
 		profile.codec == CHIAKI_CODEC_H265 ? "h265" : "h264");
-	CHIAKI_LOGI(log, "Session profile: %s", ctx->profile_desc);
+	CHIAKI_LOGI(log, "Session profile: %s, bitrate %u kbps (%s)", ctx->profile_desc,
+		profile.bitrate, cfg->bitrate);
 
 	const char *decoder_name = cfg->decoder;
 	if(!decoder_name[0] || !strcmp(decoder_name, "software") || !strcmp(decoder_name, "auto"))

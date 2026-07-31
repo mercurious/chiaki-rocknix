@@ -28,6 +28,7 @@ void rknx_config_defaults(RknxConfig *cfg)
 	cfg->audio_boost = 1.0;
 	snprintf(cfg->haptics, sizeof(cfg->haptics), "normal");
 	cfg->trigger_deadzone = 0.10;
+	snprintf(cfg->bitrate, sizeof(cfg->bitrate), "auto");
 }
 
 void rknx_config_default_path(char *buf, size_t buf_size)
@@ -126,6 +127,8 @@ int rknx_config_load(RknxConfig *cfg, const char *path, ChiakiLog *log)
 			if(cfg->trigger_deadzone < 0.0 || cfg->trigger_deadzone > 0.4)
 				cfg->trigger_deadzone = 0.10;
 		}
+		else if(!strcmp(key, "bitrate"))
+			snprintf(cfg->bitrate, sizeof(cfg->bitrate), "%s", val);
 		else
 			CHIAKI_LOGW(log, "Unknown config key \"%s\"", key);
 	}
@@ -193,11 +196,12 @@ int rknx_config_save(const RknxConfig *cfg, const char *path, ChiakiLog *log)
 		"decoder = %s\n"
 		"audio_boost = %.2f\n"
 		"haptics = %s\n"
-		"trigger_deadzone = %.2f\n",
+		"trigger_deadzone = %.2f\n"
+		"bitrate = %s\n",
 		cfg->host_addr, cfg->nickname, cfg->target, cfg->psn_account_id_b64,
 		regist_key_b64, rp_key_b64,
 		cfg->resolution, cfg->fps, cfg->codec, cfg->decoder, cfg->audio_boost,
-		cfg->haptics, cfg->trigger_deadzone);
+		cfg->haptics, cfg->trigger_deadzone, cfg->bitrate);
 	fclose(f);
 	if(chmod(tmp_path, 0600) < 0 || rename(tmp_path, path) < 0)
 	{
